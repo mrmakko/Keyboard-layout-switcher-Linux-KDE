@@ -1,15 +1,11 @@
 #!/usr/bin/python3
-"""Replace selected text with the other keyboard layout, in place.
+"""Replace selected text with the other keyboard layout, in place."""
 
-Runs a save/paste/restore clipboard transaction so the previous clipboard
-contents survive the paste. See README.md.
-"""
-
-# Copyright (C) 2026 layout-fix contributors
 # SPDX-License-Identifier: GPL-3.0-or-later
 
 from __future__ import annotations
 
+import ctypes
 import fcntl
 import os
 from pathlib import Path
@@ -55,11 +51,8 @@ COPYQ_RESTORE_SCRIPT = (
     f'copy(unpack(read("{COPYQ_ITEM_MIME}",0))); remove(0);'
 )
 
-# The private CopyQ session runs with `clipboard_mime_size_limit=image/:0`,
-# which short-circuits ClipboardDataGuard::getImageData() and with it the
-# crashing QMimeData::imageData() path (see docs/copyq-image-crash.md). CopyQ therefore
-# cannot save or restore binary image data any more, so an image-only
-# clipboard is snapshotted and restored as raw bytes through wl-clipboard.
+# The CopyQ session is configured not to read image data, so an image-only
+# clipboard is saved and restored as raw bytes instead.
 WL_PASTE = "wl-paste"
 WL_COPY = "wl-copy"
 IMAGE_MIME_PREFERENCE = (
@@ -74,13 +67,11 @@ TEXTUAL_MIME_NAMES = ("UTF8_STRING", "STRING", "TEXT", "application/x-kde4-urili
 
 DEFAULT_LAYOUTS_TOML = r"""# layout-fix layout definitions.
 #
-# Write your own copy with:
-#     layout-fix --dump-layouts > ~/.config/layout-fix/layouts.toml
+# Generate a pair with `layout-fix --generate-layouts us ru`.
 #
-# Every row maps the two layouts to each other character by character, so both
-# strings of a row must have the same length. Shifted characters go into the
-# same row as the unshifted ones. Characters that are letters in a layout are
-# what the converter uses to detect which layout a word was typed in.
+# Rows map the two layouts character by character, so both strings of a row
+# must have the same length. Letters in these rows are what the converter uses
+# to detect which layout a word was typed in.
 
 # Pair the shortcut converts between. Defaults to the first pair below.
 active = "us-ru"
@@ -89,10 +80,7 @@ active = "us-ru"
 name = "us-ru"
 first = "us"
 second = "ru"
-# Positions of the two layouts in the KDE layout list, as used by
-# org.kde.KeyboardLayouts.setLayout. List yours with:
-#     gdbus call --session --dest org.kde.keyboard --object-path /Layouts \
-#         --method org.kde.KeyboardLayouts.getLayoutsList
+# Positions of the two layouts in the KDE layout list. See README.md.
 first_kde_index = 0
 second_kde_index = 1
 rows = [
@@ -106,6 +94,131 @@ rows = [
 """
 
 WHITESPACE = (" ", "\t", "\n", "\r")
+
+XKB_LIBRARY = "libxkbcommon.so.0"
+# Keys of the alphanumeric block, grouped into the physical rows they form.
+KEY_GROUPS = (("TLDE", "AE"), ("AD",), ("AC",), ("BKSL", "AB"))
+KEY_LEVELS = (0, 1)
+
+
+class XkbRuleNames(ctypes.Structure):
+    _fields_ = [
+        (name, ctypes.c_char_p)
+        for name in ("rules", "model", "layout", "variant", "options")
+    ]
+
+
+def load_xkbcommon() -> ctypes.CDLL:
+    try:
+        library = ctypes.CDLL(XKB_LIBRARY)
+    except OSError as error:
+        raise ConfigError(f"cannot load {XKB_LIBRARY}: {error}") from error
+    library.xkb_context_new.restype = ctypes.c_void_p
+    library.xkb_context_new.argtypes = [ctypes.c_int]
+    library.xkb_keymap_new_from_names.restype = ctypes.c_void_p
+    library.xkb_keymap_new_from_names.argtypes = [
+        ctypes.c_void_p, ctypes.POINTER(XkbRuleNames), ctypes.c_int
+    ]
+    library.xkb_keymap_min_keycode.restype = ctypes.c_uint32
+    library.xkb_keymap_max_keycode.restype = ctypes.c_uint32
+    library.xkb_keymap_min_keycode.argtypes = [ctypes.c_void_p]
+    library.xkb_keymap_max_keycode.argtypes = [ctypes.c_void_p]
+    library.xkb_keymap_key_get_name.restype = ctypes.c_char_p
+    library.xkb_keymap_key_get_name.argtypes = [ctypes.c_void_p, ctypes.c_uint32]
+    library.xkb_keymap_key_get_syms_by_level.restype = ctypes.c_int
+    library.xkb_keymap_key_get_syms_by_level.argtypes = [
+        ctypes.c_void_p, ctypes.c_uint32, ctypes.c_uint32, ctypes.c_uint32,
+        ctypes.POINTER(ctypes.POINTER(ctypes.c_uint32)),
+    ]
+    library.xkb_keysym_to_utf32.restype = ctypes.c_uint32
+    library.xkb_keysym_to_utf32.argtypes = [ctypes.c_uint32]
+    return library
+
+
+def key_group(name: str) -> int | None:
+    for index, prefixes in enumerate(KEY_GROUPS):
+        for prefix in prefixes:
+            if name == prefix or (name.startswith(prefix) and name[len(prefix):].isdigit()):
+                return index
+    return None
+
+
+def read_keymap(first: str, second: str) -> dict[int, list[tuple[str, str]]]:
+    """Return, per keyboard row, the characters the two layouts produce."""
+    library = load_xkbcommon()
+    context = library.xkb_context_new(0)
+    if not context:
+        raise ConfigError("cannot create an XKB context")
+    layouts, variants = zip(*(part.split(":", 1) if ":" in part else (part, "")
+                              for part in (first, second)))
+    names = XkbRuleNames(
+        None, None, ",".join(layouts).encode(), ",".join(variants).encode(), None
+    )
+    keymap = library.xkb_keymap_new_from_names(context, ctypes.byref(names), 0)
+    if not keymap:
+        raise ConfigError(f"XKB has no keymap for \"{first}\" and \"{second}\"")
+
+    def character(key: int, group: int, level: int) -> str | None:
+        symbols = ctypes.POINTER(ctypes.c_uint32)()
+        if library.xkb_keymap_key_get_syms_by_level(
+            keymap, key, group, level, ctypes.byref(symbols)
+        ) != 1:
+            return None
+        codepoint = library.xkb_keysym_to_utf32(symbols[0])
+        character = chr(codepoint) if codepoint else None
+        return None if character is None or character.isspace() else character
+
+    rows: dict[int, list[tuple[str, str]]] = {index: [] for index in range(len(KEY_GROUPS))}
+    seen: set[str] = set()
+    for key in range(library.xkb_keymap_min_keycode(keymap),
+                     library.xkb_keymap_max_keycode(keymap) + 1):
+        name = library.xkb_keymap_key_get_name(keymap, key)
+        group = key_group(name.decode() if name else "")
+        if group is None:
+            continue
+        pairs = [(character(key, 0, level), character(key, 1, level)) for level in KEY_LEVELS]
+        if any(left is None or right is None for left, right in pairs):
+            continue
+        if any(left in seen for left, _ in pairs):
+            continue
+        seen.update(left for left, _ in pairs)
+        rows[group].extend(pairs)  # type: ignore[arg-type]
+    if not any(rows.values()):
+        raise ConfigError(f"no shared keys between \"{first}\" and \"{second}\"")
+    return rows
+
+
+def toml_string(value: str) -> str:
+    escaped = value.replace("\\", "\\\\").replace('"', '\\"')
+    return f'"{escaped}"'
+
+
+def generate_layouts(first: str, second: str) -> str:
+    rows = read_keymap(first, second)
+    name = f"{first}-{second}".replace(":", "-")
+    lines = [
+        f"# Generated with: layout-fix --generate-layouts {first} {second}",
+        "",
+        f"active = {toml_string(name)}",
+        "",
+        "[[pairs]]",
+        f"name = {toml_string(name)}",
+        f"first = {toml_string(first.split(':')[0])}",
+        f"second = {toml_string(second.split(':')[0])}",
+        "first_kde_index = 0",
+        "second_kde_index = 1",
+        "rows = [",
+    ]
+    for group in sorted(rows):
+        pairs = rows[group]
+        if pairs:
+            left = "".join(character for character, _ in pairs)
+            right = "".join(character for _, character in pairs)
+            lines.append(f"    [{toml_string(left)}, {toml_string(right)}],")
+    lines.append("]")
+    return "\n".join(lines) + "\n"
+
+
 
 
 class ConfigError(RuntimeError):
@@ -348,11 +461,7 @@ def clipboard_types() -> list[str]:
 
 
 def image_snapshot_mime(types: list[str]) -> str | None:
-    """Return the image MIME type to snapshot as raw bytes, or None for CopyQ.
-
-    CopyQ itself ignores binary image data whenever the clipboard also offers
-    text, so the raw-bytes path is only taken for an image-only clipboard.
-    """
+    """Return the image MIME type to save as raw bytes, or None for CopyQ."""
     for mime in types:
         if mime.startswith("text/") or mime in TEXTUAL_MIME_NAMES:
             return None
@@ -378,9 +487,8 @@ def restore_clipboard(snapshot: tuple[str, bytes] | None) -> None:
         copyq_command(["eval", "--", COPYQ_RESTORE_SCRIPT])
         return
     mime, payload = snapshot
-    # wl-copy forks a background process that keeps serving the selection and
-    # inherits the standard streams, so no pipe may be left open here: waiting
-    # for it to close would block until that process is replaced.
+    # wl-copy keeps serving the selection from a forked process that inherits
+    # the standard streams, so leaving a pipe open here would block.
     result = subprocess.run(
         [WL_COPY, "--type", mime],
         check=False,
@@ -475,6 +583,14 @@ def self_test() -> int:
     assert built_in.maps["us"]["`"] == "ё" and built_in.maps["ru"][","] == "?"
     assert "q" in built_in.letters["us"] and "1" not in built_in.letters["us"]
 
+    try:
+        generated = tomllib.loads(generate_layouts("us", "ru"))
+    except ConfigError:
+        pass
+    else:
+        pair = build_layouts(select_pair(generated, "generated"), "generated")
+        assert pair.maps == built_in.maps
+
     with tempfile.TemporaryDirectory() as directory:
         config = Path(directory, "layouts.toml")
 
@@ -531,6 +647,13 @@ def main() -> int:
     if sys.argv[1:] == ["--dump-layouts"]:
         sys.stdout.write(DEFAULT_LAYOUTS_TOML)
         return 0
+    if len(sys.argv) == 4 and sys.argv[1] == "--generate-layouts":
+        try:
+            sys.stdout.write(generate_layouts(sys.argv[2], sys.argv[3]))
+        except ConfigError as error:
+            print(error, file=sys.stderr)
+            return 1
+        return 0
     if sys.argv[1:] == ["--self-test"]:
         return self_test()
     if len(sys.argv) == 3 and sys.argv[1] == "--convert":
@@ -546,7 +669,8 @@ def main() -> int:
     if len(sys.argv) != 1:
         print(
             f"usage: {sys.argv[0]} "
-            "[--self-test | --convert TEXT | --dump-layouts | --version]",
+            "[--self-test | --convert TEXT | --dump-layouts | "
+            "--generate-layouts FIRST SECOND | --version]",
             file=sys.stderr,
         )
         return 2

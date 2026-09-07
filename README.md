@@ -37,10 +37,8 @@ The shortcut itself is deliberately indirect: Input Remapper turns
 avoids grabbing a key combination that applications also use.
 
 The clipboard snapshot goes through a private CopyQ session so that all MIME
-types survive the paste, not just plain text. An image-only clipboard takes a
-`wl-paste`/`wl-copy` path instead and is restored byte for byte — CopyQ's own
-image handling is disabled in that session because it segfaults on Wayland.
-The details are in [docs/copyq-image-crash.md](docs/copyq-image-crash.md).
+types survive the paste, not just plain text. An image clipboard is saved and
+restored byte for byte through `wl-clipboard`.
 
 ## Requirements
 
@@ -78,16 +76,21 @@ configuration alone.
 
 ## Configuring layouts
 
-Layout tables live in `~/.config/layout-fix/layouts.toml`. Print the built-in
-defaults to start from:
+Layout tables live in `~/.config/layout-fix/layouts.toml`. Generate a pair
+from the XKB definitions your system already has, instead of typing it out:
 
 ```bash
-layout-fix --dump-layouts > ~/.config/layout-fix/layouts.toml
+layout-fix --generate-layouts us ru > ~/.config/layout-fix/layouts.toml
 ```
 
-Each pair maps two layouts to each other row by row. Both strings of a row
-must be the same length, and shifted characters go in the same row as the
-unshifted ones:
+Both arguments are XKB layout names, optionally with a variant
+(`us:dvorak`). `us ua`, `us de`, `us gr` and `us il` all work; anything
+`xkeyboard-config` knows is worth trying. `layout-fix --dump-layouts` prints
+the built-in US/Russian tables if you would rather start from those.
+
+The result is a pair mapping the two layouts to each other row by row. Both
+strings of a row must be the same length, and shifted characters go in the
+same row as the unshifted ones:
 
 ```toml
 active = "us-ru"
@@ -99,8 +102,8 @@ second = "ru"
 first_kde_index = 0
 second_kde_index = 1
 rows = [
-    ["`~", "ёЁ"],
-    ["qwertyuiop[]QWERTYUIOP{}", "йцукенгшщзхъЙЦУКЕНГШЩЗХЪ"],
+    ["qQwWeErRtTyYuUiIoOpP[{]}", "йЙцЦуУкКеЕнНгГшШщЩзЗхХъЪ"],
+    ["aAsSdDfFgGhHjJkKlL;:'\"", "фФыЫвВаАпПрРоОлЛдДжЖэЭ"],
 ]
 ```
 
@@ -114,7 +117,7 @@ gdbus call --session --dest org.kde.keyboard --object-path /Layouts \
 
 Define as many `[[pairs]]` as you like and choose one with `active`. Which
 characters count as letters — and therefore drive layout detection — is
-derived from the rows, so a `de`, `uk` or `he` pair needs no code changes.
+derived from the rows, so a new pair needs no code changes.
 
 Known limitation: one pair is active at a time. A three-layout setup has to
 pick which two the shortcut converts between.
@@ -124,9 +127,10 @@ pick which two the shortcut converts between.
 Select text, press `Left Ctrl+Space`. Nothing else.
 
 ```bash
-layout-fix --convert 'ghbdtn'   # convert a string on stdout, touch nothing
-layout-fix --dump-layouts       # print the built-in layout tables
-layout-fix --self-test          # run the offline test suite
+layout-fix --convert 'ghbdtn'          # convert a string, touch nothing else
+layout-fix --generate-layouts us ru    # build layout tables from XKB
+layout-fix --dump-layouts              # print the built-in tables
+layout-fix --self-test                 # run the offline test suite
 layout-fix --version
 ```
 
@@ -152,5 +156,4 @@ src/layout-fix                 the program, a single Python file
 install.sh                     per-user installer and uninstaller
 config/                        templates install.sh renders into place
 examples/input-remapper-2/     reference Input Remapper mapping
-docs/copyq-image-crash.md      why the clipboard code avoids CopyQ's image path
 ```
