@@ -1,0 +1,623 @@
+#!/usr/bin/python3
+"""Replace selected text with the other keyboard layout, in place.
+
+Runs a save/paste/restore clipboard transaction so the previous clipboard
+contents survive the paste. See README.md.
+"""
+
+# Copyright (C) 2026 layout-fix contributors
+# SPDX-License-Identifier: GPL-3.0-or-later
+
+from __future__ import annotations
+
+import fcntl
+import os
+from pathlib import Path
+import shutil
+import subprocess
+import sys
+import tempfile
+import time
+import tomllib
+from typing import NamedTuple
+
+
+VERSION = "1.0.0"
+
+
+YDOTOOL_ENV = {**os.environ, "YDOTOOL_SOCKET": "/tmp/.ydotool_socket"}
+CTRL = 29
+V_KEY = 47
+PASTE_SETTLE_SECONDS = 0.3
+LOCK_PATH = Path(f"/tmp/layout-fix-{os.getuid()}.lock")
+COPYQ = "/usr/bin/copyq"
+COPYQ_ENV = {
+    **os.environ,
+    "QT_QPA_PLATFORM": "wayland",
+}
+COPYQ_SESSION = "layout-fix"
+COPYQ_SNAPSHOT_TAB = "layout-fix-snapshot"
+COPYQ_ITEM_MIME = "application/x-copyq-item"
+COPYQ_SAVE_SCRIPT = (
+    'var f=str(clipboard("?")).split("\\n"); var i={}; '
+    'var preferred=['
+    '"text/plain;charset=utf-8","text/plain","UTF8_STRING","STRING",'
+    '"image/png","image/jpeg","image/webp","image/svg+xml",'
+    '"text/uri-list","application/x-kde4-urilist"]; '
+    'var mime=""; for(var n=0;n<preferred.length;++n) '
+    'if(f.indexOf(preferred[n])>=0){mime=preferred[n];break;} '
+    'if(!mime) fail(); i[mime]=clipboard(mime); '
+    f'tab("{COPYQ_SNAPSHOT_TAB}"); while(size()) remove(0); '
+    f'write(0,"{COPYQ_ITEM_MIME}",pack(i));'
+)
+COPYQ_RESTORE_SCRIPT = (
+    f'tab("{COPYQ_SNAPSHOT_TAB}"); if(!size()) fail(); '
+    f'copy(unpack(read("{COPYQ_ITEM_MIME}",0))); remove(0);'
+)
+
+# The private CopyQ session runs with `clipboard_mime_size_limit=image/:0`,
+# which short-circuits ClipboardDataGuard::getImageData() and with it the
+# crashing QMimeData::imageData() path (see docs/copyq-image-crash.md). CopyQ therefore
+# cannot save or restore binary image data any more, so an image-only
+# clipboard is snapshotted and restored as raw bytes through wl-clipboard.
+WL_PASTE = "wl-paste"
+WL_COPY = "wl-copy"
+IMAGE_MIME_PREFERENCE = (
+    "image/png",
+    "image/webp",
+    "image/jpeg",
+    "image/bmp",
+    "image/gif",
+)
+TEXTUAL_MIME_NAMES = ("UTF8_STRING", "STRING", "TEXT", "application/x-kde4-urilist")
+
+
+DEFAULT_LAYOUTS_TOML = r"""# layout-fix layout definitions.
+#
+# Write your own copy with:
+#     layout-fix --dump-layouts > ~/.config/layout-fix/layouts.toml
+#
+# Every row maps the two layouts to each other character by character, so both
+# strings of a row must have the same length. Shifted characters go into the
+# same row as the unshifted ones. Characters that are letters in a layout are
+# what the converter uses to detect which layout a word was typed in.
+
+# Pair the shortcut converts between. Defaults to the first pair below.
+active = "us-ru"
+
+[[pairs]]
+name = "us-ru"
+first = "us"
+second = "ru"
+# Positions of the two layouts in the KDE layout list, as used by
+# org.kde.KeyboardLayouts.setLayout. List yours with:
+#     gdbus call --session --dest org.kde.keyboard --object-path /Layouts \
+#         --method org.kde.KeyboardLayouts.getLayoutsList
+first_kde_index = 0
+second_kde_index = 1
+rows = [
+    ["`~", "ёЁ"],
+    ["1234567890-=!@#$%^&*()_+", "1234567890-=!\"№;%:?*()_+"],
+    ["qwertyuiop[]QWERTYUIOP{}", "йцукенгшщзхъЙЦУКЕНГШЩЗХЪ"],
+    ["\\|", "\\/"],
+    ["asdfghjkl;'ASDFGHJKL:\"", "фывапролджэФЫВАПРОЛДЖЭ"],
+    ["zxcvbnm,./ZXCVBNM<>?", "ячсмитьбю.ЯЧСМИТЬБЮ,"],
+]
+"""
+
+WHITESPACE = (" ", "\t", "\n", "\r")
+
+
+class ConfigError(RuntimeError):
+    """The layout configuration is missing a field or is inconsistent."""
+
+
+class Layouts(NamedTuple):
+    names: tuple[str, str]
+    maps: dict[str, dict[str, str]]
+    letters: dict[str, frozenset[str]]
+    kde_index: dict[str, int]
+
+    def other(self, name: str) -> str:
+        first, second = self.names
+        return second if name == first else first
+
+
+def layouts_config_path() -> Path | None:
+    """Return the layout configuration to read, or None for the built-in one."""
+    override = os.environ.get("LAYOUT_FIX_CONFIG")
+    if override:
+        return Path(override)
+    config_home = os.environ.get("XDG_CONFIG_HOME") or "~/.config"
+    path = Path(config_home).expanduser() / "layout-fix" / "layouts.toml"
+    return path if path.is_file() else None
+
+
+def select_pair(document: dict, source: str) -> dict:
+    pairs = document.get("pairs")
+    if not isinstance(pairs, list) or not pairs:
+        raise ConfigError(f"{source}: no [[pairs]] defined")
+    active = document.get("active")
+    if active is None:
+        return pairs[0]
+    for pair in pairs:
+        if isinstance(pair, dict) and pair.get("name") == active:
+            return pair
+    raise ConfigError(f'{source}: no pair named "{active}"')
+
+
+def build_layouts(pair: dict, source: str) -> Layouts:
+    def field(name: str, expected: type):
+        if name not in pair:
+            raise ConfigError(f"{source}: pair is missing {name}")
+        value = pair[name]
+        if not isinstance(value, expected):
+            raise ConfigError(f"{source}: {name} must be {expected.__name__}")
+        return value
+
+    first = field("first", str)
+    second = field("second", str)
+    if first == second:
+        raise ConfigError(f"{source}: first and second must differ")
+
+    maps: dict[str, dict[str, str]] = {first: {}, second: {}}
+    for number, row in enumerate(field("rows", list), start=1):
+        if not isinstance(row, list) or len(row) != 2 or not all(isinstance(side, str) for side in row):
+            raise ConfigError(f"{source}: row {number} must be two strings")
+        left, right = row
+        if len(left) != len(right):
+            raise ConfigError(
+                f"{source}: row {number} maps {len(left)} characters to {len(right)}"
+            )
+        for left_char, right_char in zip(left, right, strict=True):
+            maps[first][left_char] = right_char
+            maps[second][right_char] = left_char
+
+    for table in maps.values():
+        table.update({char: char for char in WHITESPACE})
+
+    letters = {
+        name: frozenset(char for char in table if char.isalpha())
+        for name, table in maps.items()
+    }
+    for name, alphabet in letters.items():
+        if not alphabet:
+            raise ConfigError(f"{source}: layout {name} maps no letters")
+
+    return Layouts(
+        names=(first, second),
+        maps=maps,
+        letters=letters,
+        kde_index={
+            first: field("first_kde_index", int),
+            second: field("second_kde_index", int),
+        },
+    )
+
+
+def load_layouts(path: Path | None = None) -> Layouts:
+    if path is None:
+        path = layouts_config_path()
+    if path is None:
+        text, source = DEFAULT_LAYOUTS_TOML, "built-in layouts"
+    else:
+        try:
+            text, source = path.read_text(encoding="utf-8"), str(path)
+        except OSError as error:
+            raise ConfigError(f"{path}: {error}") from error
+    try:
+        document = tomllib.loads(text)
+    except (tomllib.TOMLDecodeError, UnicodeDecodeError) as error:
+        raise ConfigError(f"{source}: {error}") from error
+    return build_layouts(select_pair(document, source), source)
+
+
+_LAYOUTS: Layouts | None = None
+
+
+def layouts() -> Layouts:
+    global _LAYOUTS
+    if _LAYOUTS is None:
+        _LAYOUTS = load_layouts()
+    return _LAYOUTS
+
+
+def notify(message: str) -> None:
+    subprocess.run(
+        ["notify-send", "Keyboard Layout Fix", message],
+        check=False,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+
+
+def run_bytes(command: list[str], *, timeout: float = 5.0) -> bytes:
+    result = subprocess.run(
+        command,
+        check=False,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        timeout=timeout,
+    )
+    if result.returncode != 0:
+        error = result.stderr.decode("utf-8", errors="replace").strip()
+        raise RuntimeError(error or f"command failed: {command[0]}")
+    return result.stdout
+
+
+def selected_text() -> str:
+    try:
+        data = run_bytes(["wl-paste", "--primary", "--no-newline"])
+    except RuntimeError:
+        return ""
+    return data.decode("utf-8", errors="strict")
+
+
+def letter_layout(char: str, active: Layouts) -> str | None:
+    for name, alphabet in active.letters.items():
+        if char in alphabet:
+            return name
+    return None
+
+
+def convert_token(token: str, active: Layouts) -> tuple[str, str | None]:
+    direct_layouts = [letter_layout(char, active) for char in token]
+    left_layouts: list[str | None] = []
+    nearest: str | None = None
+    for direct_layout in direct_layouts:
+        left_layouts.append(nearest)
+        if direct_layout is not None:
+            nearest = direct_layout
+
+    right_layouts: list[str | None] = [None] * len(token)
+    nearest = None
+    for index in range(len(token) - 1, -1, -1):
+        right_layouts[index] = nearest
+        if direct_layouts[index] is not None:
+            nearest = direct_layouts[index]
+
+    converted: list[str] = []
+    last_letter_layout: str | None = None
+    for index, char in enumerate(token):
+        direct_layout = direct_layouts[index]
+        source_layout = direct_layout or left_layouts[index] or right_layouts[index]
+
+        if source_layout is None:
+            holders = [name for name in active.names if char in active.maps[name]]
+            if len(holders) == 1:
+                source_layout = holders[0]
+
+        if source_layout is not None and char in active.maps[source_layout]:
+            converted.append(active.maps[source_layout][char])
+        else:
+            converted.append(char)
+
+        if direct_layout is not None:
+            last_letter_layout = direct_layout
+
+    return "".join(converted), last_letter_layout
+
+
+def convert_selection(text: str, active: Layouts | None = None) -> tuple[str, str] | None:
+    active = active or layouts()
+    converted: list[str] = []
+    last_source_layout: str | None = None
+    index = 0
+
+    while index < len(text):
+        if text[index].isspace():
+            converted.append(text[index])
+            index += 1
+            continue
+
+        end = index + 1
+        while end < len(text) and not text[end].isspace():
+            end += 1
+        converted_token, token_layout = convert_token(text[index:end], active)
+        converted.append(converted_token)
+        if token_layout is not None:
+            last_source_layout = token_layout
+        index = end
+
+    if last_source_layout is None:
+        return None
+    return "".join(converted), active.other(last_source_layout)
+
+
+def copyq_command(arguments: list[str], *, timeout: float = 5.0) -> None:
+    result = subprocess.run(
+        [COPYQ, "--session", COPYQ_SESSION, *arguments],
+        check=False,
+        env=COPYQ_ENV,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.PIPE,
+        timeout=timeout,
+    )
+    if result.returncode != 0:
+        error = result.stderr.decode("utf-8", errors="replace").strip()
+        raise RuntimeError(error or "CopyQ command failed")
+
+
+def clipboard_types() -> list[str]:
+    try:
+        listing = run_bytes([WL_PASTE, "--list-types"])
+    except RuntimeError:
+        return []
+    text = listing.decode("utf-8", errors="replace")
+    return [line.strip() for line in text.splitlines() if line.strip()]
+
+
+def image_snapshot_mime(types: list[str]) -> str | None:
+    """Return the image MIME type to snapshot as raw bytes, or None for CopyQ.
+
+    CopyQ itself ignores binary image data whenever the clipboard also offers
+    text, so the raw-bytes path is only taken for an image-only clipboard.
+    """
+    for mime in types:
+        if mime.startswith("text/") or mime in TEXTUAL_MIME_NAMES:
+            return None
+    for mime in IMAGE_MIME_PREFERENCE:
+        if mime in types:
+            return mime
+    return None
+
+
+def snapshot_clipboard() -> tuple[str, bytes] | None:
+    mime = image_snapshot_mime(clipboard_types())
+    if mime is None:
+        copyq_command(["eval", "--", COPYQ_SAVE_SCRIPT])
+        return None
+    payload = run_bytes([WL_PASTE, "--no-newline", "--type", mime])
+    if not payload:
+        raise RuntimeError(f"empty clipboard data for {mime}")
+    return mime, payload
+
+
+def restore_clipboard(snapshot: tuple[str, bytes] | None) -> None:
+    if snapshot is None:
+        copyq_command(["eval", "--", COPYQ_RESTORE_SCRIPT])
+        return
+    mime, payload = snapshot
+    # wl-copy forks a background process that keeps serving the selection and
+    # inherits the standard streams, so no pipe may be left open here: waiting
+    # for it to close would block until that process is replaced.
+    result = subprocess.run(
+        [WL_COPY, "--type", mime],
+        check=False,
+        input=payload,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        timeout=5.0,
+    )
+    if result.returncode != 0:
+        raise RuntimeError("wl-copy failed")
+
+
+def write_replacement(text: str) -> None:
+    copyq_command(["copy", "--", "text/plain;charset=utf-8", text])
+
+
+def set_kde_layout(layout: str, active: Layouts) -> bool:
+    result = subprocess.run(
+        [
+            "gdbus",
+            "call",
+            "--session",
+            "--dest",
+            "org.kde.keyboard",
+            "--object-path",
+            "/Layouts",
+            "--method",
+            "org.kde.KeyboardLayouts.setLayout",
+            str(active.kde_index[layout]),
+        ],
+        check=False,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    return result.returncode == 0
+
+
+def paste_once() -> bool:
+    result = subprocess.run(
+        ["ydotool", "key", f"{CTRL}:1", f"{V_KEY}:1", f"{V_KEY}:0", f"{CTRL}:0"],
+        check=False,
+        env=YDOTOOL_ENV,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    return result.returncode == 0
+
+
+def clipboard_transaction(replacement: str, snapshot: tuple[str, bytes] | None) -> bool:
+    try:
+        write_replacement(replacement)
+        pasted = paste_once()
+        time.sleep(PASTE_SETTLE_SECONDS)
+    finally:
+        restore_clipboard(snapshot)
+    return pasted
+
+
+def self_test() -> int:
+    cases = {
+        "ghbdtn": "привет",
+        "привет": "ghbdtn",
+        "Ghbdtn, Vbh!": "Приветб Мир!",
+        "руддщ": "hello",
+        "ghbdtn руддщ": "привет hello",
+        "ghbdtnруддщ": "приветhello",
+        "ghbdtn🙂 привет": "привет🙂 ghbdtn",
+        "ghbdtn, руддщ!": "приветб hello!",
+        "yt kexit kb b[ elfkznm bp bc[jlys[ lfyys[? f yt gjckt гзысфду,": (
+            "не лучше ли их удалять из исходных данных, а не после upscale?"
+        ),
+    }
+    for source, expected in cases.items():
+        conversion = convert_selection(source)
+        assert conversion is not None
+        actual, _target_layout = conversion
+        assert actual == expected, (source, actual, expected)
+    assert convert_selection("123 — 🙂") is None
+    assert convert_selection("ghbdtn руддщ") == ("привет hello", "us")
+    assert convert_selection("руддщ ghbdtn") == ("hello привет", "ru")
+    assert image_snapshot_mime(["image/png", "image/bmp"]) == "image/png"
+    assert image_snapshot_mime(["image/bmp"]) == "image/bmp"
+    assert image_snapshot_mime(["image/png", "text/plain;charset=utf-8"]) is None
+    assert image_snapshot_mime(["image/png", "UTF8_STRING"]) is None
+    assert image_snapshot_mime(["image/svg+xml"]) is None
+    assert image_snapshot_mime([]) is None
+
+    built_in = load_layouts()
+    assert built_in.names == ("us", "ru")
+    assert built_in.kde_index == {"us": 0, "ru": 1}
+    assert built_in.other("us") == "ru" and built_in.other("ru") == "us"
+    assert built_in.maps["us"]["`"] == "ё" and built_in.maps["ru"][","] == "?"
+    assert "q" in built_in.letters["us"] and "1" not in built_in.letters["us"]
+
+    with tempfile.TemporaryDirectory() as directory:
+        config = Path(directory, "layouts.toml")
+
+        config.write_text(
+            '[[pairs]]\nname = "a-b"\nfirst = "a"\nsecond = "b"\n'
+            'first_kde_index = 2\nsecond_kde_index = 3\nrows = [["xy", "яю"]]\n',
+            encoding="utf-8",
+        )
+        custom = load_layouts(config)
+        assert custom.names == ("a", "b")
+        assert custom.kde_index == {"a": 2, "b": 3}
+        assert convert_selection("xy", custom) == ("яю", "b")
+        assert convert_selection("яю", custom) == ("xy", "a")
+
+        config.write_text(
+            'active = "second"\n'
+            '[[pairs]]\nname = "first"\nfirst = "a"\nsecond = "b"\n'
+            'first_kde_index = 0\nsecond_kde_index = 1\nrows = [["x", "я"]]\n'
+            '[[pairs]]\nname = "second"\nfirst = "c"\nsecond = "d"\n'
+            'first_kde_index = 0\nsecond_kde_index = 1\nrows = [["z", "ю"]]\n',
+            encoding="utf-8",
+        )
+        assert load_layouts(config).names == ("c", "d")
+
+        for broken, reason in (
+            ('[[pairs]]\nfirst = "a"\nsecond = "b"\n'
+             'first_kde_index = 0\nsecond_kde_index = 1\nrows = [["xy", "я"]]\n',
+             "row length mismatch"),
+            ('[[pairs]]\nfirst = "a"\nsecond = "b"\nrows = [["x", "я"]]\n',
+             "missing KDE index"),
+            ('active = "missing"\n[[pairs]]\nname = "a-b"\nfirst = "a"\n'
+             'second = "b"\nfirst_kde_index = 0\nsecond_kde_index = 1\n'
+             'rows = [["x", "я"]]\n',
+             "unknown active pair"),
+            ("rows = []\n", "no pairs"),
+            ("this is not toml\n", "invalid TOML"),
+        ):
+            config.write_text(broken, encoding="utf-8")
+            try:
+                load_layouts(config)
+            except ConfigError:
+                pass
+            else:
+                raise AssertionError(f"accepted a broken config: {reason}")
+
+    print("layout-fix self-test: OK")
+    return 0
+
+
+def main() -> int:
+    if sys.argv[1:] == ["--version"]:
+        print(f"layout-fix {VERSION}")
+        return 0
+    if sys.argv[1:] == ["--dump-layouts"]:
+        sys.stdout.write(DEFAULT_LAYOUTS_TOML)
+        return 0
+    if sys.argv[1:] == ["--self-test"]:
+        return self_test()
+    if len(sys.argv) == 3 and sys.argv[1] == "--convert":
+        try:
+            conversion = convert_selection(sys.argv[2])
+        except ConfigError as error:
+            print(error, file=sys.stderr)
+            return 1
+        if conversion is None:
+            return 1
+        print(conversion[0])
+        return 0
+    if len(sys.argv) != 1:
+        print(
+            f"usage: {sys.argv[0]} "
+            "[--self-test | --convert TEXT | --dump-layouts | --version]",
+            file=sys.stderr,
+        )
+        return 2
+
+    try:
+        active = layouts()
+    except ConfigError as error:
+        notify(f"Invalid layout configuration. {error}")
+        return 1
+
+    missing = [
+        name
+        for name in (WL_PASTE, WL_COPY, "gdbus", "ydotool")
+        if shutil.which(name) is None
+    ]
+    if not os.access(COPYQ, os.X_OK):
+        missing.append("CopyQ helper")
+    if missing:
+        notify("Missing dependency: " + ", ".join(missing))
+        return 1
+
+    LOCK_PATH.parent.mkdir(parents=True, exist_ok=True)
+    lock_file = LOCK_PATH.open("w")
+    try:
+        fcntl.flock(lock_file, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        return 0
+
+    try:
+        text = selected_text()
+    except (RuntimeError, subprocess.TimeoutExpired):
+        notify("Could not read the selected text.")
+        return 1
+    except UnicodeDecodeError:
+        notify("The selected text is not valid UTF-8.")
+        return 1
+    if not text:
+        notify("Select some text first.")
+        return 1
+
+    conversion = convert_selection(text, active)
+    if conversion is None:
+        notify("The selection contains no Russian or English letters.")
+        return 1
+    replacement, target_layout = conversion
+
+    try:
+        snapshot = snapshot_clipboard()
+    except subprocess.TimeoutExpired:
+        notify("Clipboard snapshot timed out.")
+        return 1
+    except (RuntimeError, UnicodeDecodeError):
+        notify("Could not save the clipboard.")
+        return 1
+    if not set_kde_layout(target_layout, active):
+        notify("Could not switch the KDE keyboard layout.")
+        return 1
+
+    try:
+        pasted = clipboard_transaction(replacement, snapshot)
+    except subprocess.TimeoutExpired:
+        notify("Clipboard operation timed out.")
+        return 1
+    except RuntimeError:
+        notify("Clipboard operation failed.")
+        return 1
+    if not pasted:
+        notify("Could not paste the converted text. Check ydotoold.")
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

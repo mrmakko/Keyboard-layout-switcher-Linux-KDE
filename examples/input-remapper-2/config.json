@@ -1,0 +1,7 @@
+{
+    "version": "2.2.1",
+    "autoload": {
+        "YICHIP Wireless Device": "layout-fix",
+        "ASUSTeK Computer Inc. N-KEY Device": "layout-fix"
+    }
+}

@@ -1,0 +1,12 @@
+[
+    {
+        "input_combination": [
+            {"type": 1, "code": 29},
+            {"type": 1, "code": 57}
+        ],
+        "target_uinput": "keyboard",
+        "output_type": 1,
+        "output_code": 194,
+        "release_combination_keys": true
+    }
+]

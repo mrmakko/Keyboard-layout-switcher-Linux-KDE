@@ -1,0 +1,12 @@
+[Unit]
+Description=Load LCtrl+Space to F24 mapping for layout-fix
+After=graphical-session.target input-remapper.service
+PartOf=graphical-session.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/input-remapper-control --command autoload --config-dir @CONFIG_HOME@/input-remapper-2
+RemainAfterExit=yes
+
+[Install]
+WantedBy=default.target
