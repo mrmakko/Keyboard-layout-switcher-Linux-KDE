@@ -25,6 +25,9 @@ YDOTOOL_ENV = {**os.environ, "YDOTOOL_SOCKET": "/tmp/.ydotool_socket"}
 CTRL = 29
 V_KEY = 47
 PASTE_SETTLE_SECONDS = 0.3
+# The shortcut fires while its own modifiers are still held, so give them a
+# moment to be released before synthesizing Ctrl+V.
+MODIFIER_SETTLE_SECONDS = 0.25
 LOCK_PATH = Path(f"/tmp/layout-fix-{os.getuid()}.lock")
 COPYQ = "/usr/bin/copyq"
 COPYQ_ENV = {
@@ -540,6 +543,7 @@ def paste_once() -> bool:
 def clipboard_transaction(replacement: str, snapshot: tuple[str, bytes] | None) -> bool:
     try:
         write_replacement(replacement)
+        time.sleep(MODIFIER_SETTLE_SECONDS)
         pasted = paste_once()
         time.sleep(PASTE_SETTLE_SECONDS)
     finally:

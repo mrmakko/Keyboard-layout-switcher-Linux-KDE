@@ -38,9 +38,11 @@ except a private clipboard session.
    `ydotool`, and the previous clipboard is restored.
 4. The KDE keyboard layout is switched to the one the converted text is in.
 
-The shortcut itself is deliberately indirect: Input Remapper turns
-`Left Ctrl+Space` into `F24`, and KDE binds `F24` to the desktop entry. This
-avoids grabbing a key combination that applications also use.
+The shortcut is an ordinary KDE global shortcut, registered by the installed
+desktop entry. `Ctrl+Space` by default; `--shortcut` picks another one. If you
+want only the left Ctrl to trigger it — so that `Right Ctrl+Space` still
+reaches applications that use it — `install.sh --left-ctrl` sets up Input
+Remapper to turn `Left Ctrl+Space` into `F24` and binds that instead.
 
 The clipboard snapshot goes through a private CopyQ session so that all MIME
 types survive the paste, not just plain text. An image clipboard is saved and
@@ -53,13 +55,14 @@ restored byte for byte through `wl-clipboard`.
 - `copyq`
 - `wl-clipboard` (`wl-paste`, `wl-copy`)
 - `ydotool` with a running daemon on `/tmp/.ydotool_socket`
-- `input-remapper`
 - `gdbus` and `notify-send`
+- `input-remapper`, only for `install.sh --left-ctrl`
 
 On Fedora:
 
 ```bash
-sudo dnf install copyq wl-clipboard ydotool input-remapper glib2 libnotify
+sudo dnf install copyq wl-clipboard ydotool glib2 libnotify
+sudo systemctl enable --now ydotool
 ```
 
 ## Install
@@ -70,15 +73,27 @@ cd layout-fix
 ./install.sh
 ```
 
-The script installs `~/.local/bin/layout-fix`, the user units and the desktop
-entry, writes a default `~/.config/layout-fix/layouts.toml`, and starts the
-private CopyQ session. It then prints the two steps that depend on your own
-hardware and desktop: recording the `Left Ctrl+Space` → `F24` mapping in the
-Input Remapper GUI, and binding `F24` to "Fix Keyboard Layout" in
-System Settings → Keyboard → Shortcuts → Applications.
+That is the whole installation. The script installs
+`~/.local/bin/layout-fix`, the user unit and the desktop entry, writes a
+default `~/.config/layout-fix/layouts.toml`, starts the private CopyQ session
+and registers `Ctrl+Space` as a KDE global shortcut. No GUI configuration,
+and nothing to click.
 
-`./install.sh --uninstall` removes everything it installed and leaves your
-configuration alone.
+```bash
+./install.sh --shortcut 'Meta+Space'   # bind something else
+./install.sh --left-ctrl               # Left Ctrl+Space only, via Input Remapper
+./install.sh --uninstall               # remove it all
+```
+
+`--left-ctrl` is worth it if an application of yours uses `Ctrl+Space` — a KDE
+shortcut takes the combination from every application, while Input Remapper
+consumes the left Ctrl only and leaves `Right Ctrl+Space` working. The script
+detects your keyboards, writes the Input Remapper preset and enables autoload
+itself; its GUI is not involved.
+
+The one thing the installer cannot do for you is start `ydotool`'s daemon,
+which needs root: `sudo systemctl enable --now ydotool`. The script says so if
+it is not running.
 
 ## Configuring layouts
 
@@ -154,16 +169,26 @@ without touching the clipboard or the desktop.
 ## Troubleshooting
 
 **The shortcut does nothing.** Check the chain one link at a time. First,
-whether the key reaches KDE at all — this should run the tool:
+whether the tool runs when the key reaches KDE — with `--left-ctrl` installed,
+this simulates the F24 that Input Remapper emits:
 
 ```bash
 YDOTOOL_SOCKET=/tmp/.ydotool_socket ydotool key 194:1 194:0
 ```
 
-If that works but `Left Ctrl+Space` does not, the Input Remapper preset is not
-loaded: `systemctl --user status layout-fix-input-remapper.service`. If it
-does not work either, F24 is not bound to "Fix Keyboard Layout" in
-System Settings → Keyboard → Shortcuts → Applications.
+That command is the `--left-ctrl` path; on a default install, check the
+registered shortcut instead:
+
+```bash
+gdbus call --session --dest org.kde.kglobalaccel \
+    --object-path /component/net_local_layout_fix_desktop \
+    --method org.kde.kglobalaccel.Component.allShortcutInfos
+```
+
+`67108896` is `Ctrl+Space`, `16777287` is `F24`. If the number does not match
+the shortcut you asked for, KDE is still holding the previous registration;
+re-running `./install.sh` clears it. With `--left-ctrl`, also check that the
+preset is loaded: `systemctl --user status layout-fix-input-remapper.service`.
 
 **"Could not paste the converted text. Check ydotoold."** The daemon is not
 running or its socket is elsewhere:

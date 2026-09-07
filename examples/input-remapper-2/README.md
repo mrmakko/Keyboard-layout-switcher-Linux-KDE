@@ -1,13 +1,15 @@
 # Input Remapper example
 
-These are the files from a working setup, for reference. Device names are
-specific to that machine, so record the mapping in the Input Remapper GUI
-rather than copying `config.json` verbatim:
+`install.sh --left-ctrl` writes these files for you: it detects your keyboards
+from `/proc/bus/input/devices`, drops a `layout-fix` preset into each and
+enables autoload. The copies here are only for reference, and their device
+names are specific to the machine they came from.
+
+The mapping itself:
 
 - input: `Left Ctrl` + `Space` (event codes 29 and 57)
 - output: `F24` (event code 194)
 - release combination keys: on
-- preset name: `layout-fix`, with autoload enabled for your keyboard
 
-`layout-fix-input-remapper.service`, installed by `install.sh`, then autoloads
-the preset when the graphical session starts.
+`layout-fix-input-remapper.service` then autoloads the preset when the
+graphical session starts.

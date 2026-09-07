@@ -7,4 +7,4 @@ Icon=input-keyboard
 NoDisplay=true
 StartupNotify=false
 X-KDE-GlobalAccel-CommandShortcut=true
-X-KDE-Shortcuts=F24
+X-KDE-Shortcuts=@SHORTCUT@
