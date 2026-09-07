@@ -216,6 +216,16 @@ gdbus call --session --dest org.kde.keyboard --object-path /Layouts \
     --method org.kde.KeyboardLayouts.getLayoutsList
 ```
 
+**The shortcut stopped working after switching away from `--left-ctrl`.**
+Input Remapper keeps injecting until it is told to stop, so `Left Ctrl+Space`
+is still being turned into an F24 that nothing is bound to. Re-running
+`./install.sh` handles this; by hand it is:
+
+```bash
+input-remapper-control --command stop-all
+input-remapper-control --command autoload
+```
+
 **"Could not save the clipboard."** The private clipboard session is not
 running:
 

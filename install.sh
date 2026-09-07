@@ -54,6 +54,15 @@ with open(path, "w", encoding="utf-8") as handle:
     handle.write("\n")
 PY
     rm -f "$remapper_dir"/presets/*/layout-fix.json
+    # Clearing the configuration does not release the keyboards: the daemon
+    # keeps injecting until told to stop, and a mapping to a key nothing is
+    # bound to any more swallows the shortcut silently. Per-device stop needs
+    # read access to /dev/input, which a plain user does not have, so stop
+    # everything and let autoload bring back whatever else was configured.
+    if command -v input-remapper-control >/dev/null; then
+        input-remapper-control --command stop-all >/dev/null 2>&1 || true
+        input-remapper-control --command autoload >/dev/null 2>&1 || true
+    fi
 }
 
 uninstall() {
