@@ -4,6 +4,8 @@ Select text typed in the wrong keyboard layout, press one shortcut, and it is
 replaced in place — `ghbdtn` becomes `привет` — with the system keyboard
 layout switched to match. Built for **KDE Plasma on Wayland**.
 
+![Selecting text typed in the wrong layout and converting it with one shortcut](demo.gif)
+
 ```
 ghbdtn, Vbh!                    ->  Приветб Мир!
 yt kexit kb b[ elfkznm          ->  не лучше ли их удалять
