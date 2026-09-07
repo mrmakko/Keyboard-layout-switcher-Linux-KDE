@@ -226,6 +226,19 @@ input-remapper-control --command stop-all
 input-remapper-control --command autoload
 ```
 
+**The paste feels sluggish, or lands before the shortcut keys are released.**
+Ctrl+V is synthesized only once 250 ms have passed since the key press, so the
+modifiers you are still holding do not end up inside it. Work done in the
+meantime counts towards that window, so the actual wait is usually far
+shorter. Tune it, in milliseconds, with `LAYOUT_FIX_SETTLE_MS`:
+
+```bash
+LAYOUT_FIX_SETTLE_MS=120 layout-fix     # or 0 to paste immediately
+```
+
+Make it permanent by adding `Environment=LAYOUT_FIX_SETTLE_MS=120` to the
+desktop entry's command, or by wrapping `layout-fix` in a script.
+
 **"Could not save the clipboard."** The private clipboard session is not
 running:
 

@@ -25,9 +25,11 @@ YDOTOOL_ENV = {**os.environ, "YDOTOOL_SOCKET": "/tmp/.ydotool_socket"}
 CTRL = 29
 V_KEY = 47
 PASTE_SETTLE_SECONDS = 0.3
-# The shortcut fires while its own modifiers are still held, so give them a
-# moment to be released before synthesizing Ctrl+V.
-MODIFIER_SETTLE_SECONDS = 0.25
+# The shortcut fires while its own modifiers are still held, so Ctrl+V is
+# synthesized only once this long has passed since the key press. Everything
+# done before pasting counts towards it. Tune with LAYOUT_FIX_SETTLE_MS.
+START_TIME = time.monotonic()
+DEFAULT_SETTLE_MS = 250
 LOCK_PATH = Path(f"/tmp/layout-fix-{os.getuid()}.lock")
 COPYQ = "/usr/bin/copyq"
 COPYQ_ENV = {
@@ -338,6 +340,13 @@ def layouts() -> Layouts:
     return _LAYOUTS
 
 
+def settle_seconds() -> float:
+    try:
+        return max(0.0, float(os.environ.get("LAYOUT_FIX_SETTLE_MS", DEFAULT_SETTLE_MS)) / 1000)
+    except ValueError:
+        return DEFAULT_SETTLE_MS / 1000
+
+
 def notify(message: str) -> None:
     subprocess.run(
         ["notify-send", "Keyboard Layout Fix", message],
@@ -543,7 +552,9 @@ def paste_once() -> bool:
 def clipboard_transaction(replacement: str, snapshot: tuple[str, bytes] | None) -> bool:
     try:
         write_replacement(replacement)
-        time.sleep(MODIFIER_SETTLE_SECONDS)
+        remaining = settle_seconds() - (time.monotonic() - START_TIME)
+        if remaining > 0:
+            time.sleep(remaining)
         pasted = paste_once()
         time.sleep(PASTE_SETTLE_SECONDS)
     finally:
@@ -579,6 +590,12 @@ def self_test() -> int:
     assert image_snapshot_mime(["image/png", "UTF8_STRING"]) is None
     assert image_snapshot_mime(["image/svg+xml"]) is None
     assert image_snapshot_mime([]) is None
+
+    assert settle_seconds() == DEFAULT_SETTLE_MS / 1000
+    for value, expected in (("0", 0.0), ("120", 0.12), ("-5", 0.0), ("junk", 0.25)):
+        os.environ["LAYOUT_FIX_SETTLE_MS"] = value
+        assert settle_seconds() == expected, (value, settle_seconds())
+    del os.environ["LAYOUT_FIX_SETTLE_MS"]
 
     built_in = load_layouts()
     assert built_in.names == ("us", "ru")
